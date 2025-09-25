@@ -1,0 +1,49 @@
+# ---- Python / Django ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+db.sqlite3
+local_settings.py
+.env
+.env.*
+
+# ---- Virtual Environment ----
+venv/
+.venv/
+ENV/
+env/
+*.swp
+
+# ---- Logs & Runtime ----
+*.log
+*.pot
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.sqlite
+
+# ---- Coverage & Testing ----
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+coverage.ini     
+
+# ---- Django Static/Media ----
+staticfiles/
+media/
+
+# ---- Node / Frontend ----
+node_modules/
+dist/
+build/
+*.lock
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
