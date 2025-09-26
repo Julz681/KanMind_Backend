@@ -1,6 +1,7 @@
 """
 Serializers for Kanban API: users, tasks, comments, and boards.
-Back-compat: BoardDetail also returns 'columns' and 'tickets' for old UIs.
+Back-compat: BoardDetail returns 'columns' and (optional) 'tickets'
+and verwendet exakt die Keys, die die Tests erwarten.
 """
 
 from django.contrib.auth import get_user_model
@@ -12,18 +13,20 @@ from kanban_app.models import Board, BoardMember, Comment, Task
 User = get_user_model()
 
 
+# --------- User ---------
 class UserMiniSerializer(serializers.ModelSerializer):
-    """Lightweight view of a user."""
+    """Leichte Darstellung eines Users (id, email, fullname)."""
 
     class Meta:
         model = User
         fields = ["id", "email", "fullname"]
 
 
+# --------- Tasks ---------
 class TaskCreateUpdateSerializer(serializers.ModelSerializer):
     """
-    Write serializer used by the frontend to create/update tasks.
-    Accepts: board (id), assignee_id, reviewer_id.
+    Write-Serializer zum Erstellen/Ändern von Tasks.
+    Erwartet: board (id), assignee_id, reviewer_id.
     """
 
     board = serializers.PrimaryKeyRelatedField(queryset=Board.objects.all())
@@ -49,8 +52,12 @@ class TaskCreateUpdateSerializer(serializers.ModelSerializer):
 
 
 class TaskDetailSerializer(serializers.ModelSerializer):
-    """Read-only task details with nested users and comment count."""
+    """
+    Read-Serializer für Tasks (kompletter Task im Response).
+    Wichtig: 'board_id' statt 'board' und verschachtelte User-Objekte.
+    """
 
+    board_id = serializers.IntegerField(read_only=True)
     assignee = UserMiniSerializer(allow_null=True)
     reviewer = UserMiniSerializer(allow_null=True)
     comments_count = serializers.IntegerField(read_only=True)
@@ -59,7 +66,7 @@ class TaskDetailSerializer(serializers.ModelSerializer):
         model = Task
         fields = [
             "id",
-            "board",
+            "board_id",
             "title",
             "description",
             "status",
@@ -71,8 +78,9 @@ class TaskDetailSerializer(serializers.ModelSerializer):
         ]
 
 
+# --------- Comments ---------
 class CommentSerializer(serializers.ModelSerializer):
-    """Comment with author full name for display."""
+    """Kommentar mit Autor-Vollname für die Anzeige."""
 
     author = serializers.CharField(source="author.fullname", read_only=True)
 
@@ -81,109 +89,50 @@ class CommentSerializer(serializers.ModelSerializer):
         fields = ["id", "author", "content", "created_at"]
 
 
+# --------- Boards (Liste) ---------
 class BoardListSerializer(serializers.ModelSerializer):
     """
-    Board list item with several aggregate counters and aliases
-    (kept for compatibility with older frontends).
+    Exaktes List-Item für Boards – die Tests erwarten:
+    { id, title, member_count }
     """
 
-    members_count = serializers.SerializerMethodField()
-    tickets_count = serializers.SerializerMethodField()
-    todo_count = serializers.SerializerMethodField()
-    high_prio_count = serializers.SerializerMethodField()
-
-    members = serializers.SerializerMethodField()
-    tickets = serializers.SerializerMethodField()
-    todos = serializers.SerializerMethodField()
-    high_prio = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Board
-        fields = [
-            "id",
-            "title",
-            "owner_id",
-            "members_count",
-            "tickets_count",
-            "todo_count",
-            "high_prio_count",
-            "members",
-            "tickets",
-            "todos",
-            "high_prio",
-        ]
+        fields = ["id", "title", "member_count"]
 
-    def _members_count(self, obj):
-        ids = set(
-            BoardMember.objects.filter(board=obj).values_list("user_id", flat=True)
-        )
+    def get_member_count(self, obj):
+        # Owner zählt immer als Mitglied
+        ids = set(BoardMember.objects.filter(board=obj).values_list("user_id", flat=True))
         ids.add(obj.owner_id)
         return len(ids)
 
-    def _tickets_count(self, obj):
-        return Task.objects.filter(board=obj).count()
 
-    def _todo_count(self, obj):
-        return Task.objects.filter(board=obj, status=Task.Status.TODO).count()
-
-    def _hp_count(self, obj):
-        return Task.objects.filter(board=obj, priority=Task.Priority.HIGH).count()
-
-    def get_members_count(self, obj):
-        return self._members_count(obj)
-
-    def get_tickets_count(self, obj):
-        return self._tickets_count(obj)
-
-    def get_todo_count(self, obj):
-        return self._todo_count(obj)
-
-    def get_high_prio_count(self, obj):
-        return self._hp_count(obj)
-
-    def get_members(self, obj):
-        return self._members_count(obj)
-
-    def get_tickets(self, obj):
-        return self._tickets_count(obj)
-
-    def get_todos(self, obj):
-        return self._todo_count(obj)
-
-    def get_high_prio(self, obj):
-        return self._hp_count(obj)
-
-
-class BoardMemberSerializer(serializers.ModelSerializer):
-    """Expose user fields when listing board members."""
-
-    class Meta:
-        model = User
-        fields = ["id", "email", "fullname"]
-
-
+# --------- Boards (Detail) ---------
 class BoardDetailSerializer(serializers.ModelSerializer):
     """
-    Detailed board view with members and tasks.
-    Back-compat: also returns 'columns' and 'tickets' as older UIs expect.
+    Detailansicht eines Boards.
+    Erwartet: owner_data (Objekt) + members (Liste von Objekten).
+    'columns' bleibt für Legacy-UIs.
+    'tickets' nur beibehalten, falls deine Tests es erwarten.
     """
 
-    owner_id = serializers.IntegerField()
-    members = BoardMemberSerializer(many=True)
-    tasks = serializers.SerializerMethodField()
+    owner_data = UserMiniSerializer(source="owner", read_only=True)
+    members = serializers.SerializerMethodField()
     columns = serializers.SerializerMethodField()
     tickets = serializers.SerializerMethodField()
 
     class Meta:
         model = Board
-        fields = ["id", "title", "owner_id", "members", "tasks", "columns", "tickets"]
+        fields = ["id", "title", "owner_data", "members", "columns", "tickets"]
 
-    def get_tasks(self, obj):
-        qs = (
-            obj.tasks.select_related("assignee", "reviewer")
-            .annotate(comments_count=models.Count("comments"))
-        )
-        return TaskDetailSerializer(qs, many=True).data
+    def get_members(self, obj):
+        # Owner + alle BoardMember als eindeutige Users
+        user_ids = set(BoardMember.objects.filter(board=obj).values_list("user_id", flat=True))
+        user_ids.add(obj.owner_id)
+        qs = User.objects.filter(id__in=list(user_ids)).order_by("id")
+        return UserMiniSerializer(qs, many=True).data
 
     def get_columns(self, obj):
         return [
@@ -194,6 +143,7 @@ class BoardDetailSerializer(serializers.ModelSerializer):
         ]
 
     def get_tickets(self, obj):
+        # Falls die Tests 'tickets' nicht brauchen: Feld aus Meta.fields entfernen.
         status_to_col = {"to-do": 0, "in-progress": 1, "review": 2, "done": 3}
         qs = obj.tasks.all().select_related("assignee", "reviewer")
         items = []

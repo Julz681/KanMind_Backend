@@ -3,8 +3,10 @@ Auth API views for registration, login, and email availability check.
 """
 
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError
 from rest_framework import status
 from rest_framework.authtoken.models import Token
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -31,10 +33,14 @@ class RegistrationView(APIView):
     """Public endpoint to create a new account."""
     permission_classes = [AllowAny]
 
-    def post(self, request):  # pragma: no cover - not hit by current tests
+    def post(self, request):
         serializer = RegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
+        try:
+            user = serializer.save()
+        except IntegrityError:
+            # In case a concurrent request slips through the unique validator
+            raise ValidationError({"email": ["This email is already registered."]})
         token, _ = Token.objects.get_or_create(user=user)
         return Response(token_payload(token), status=status.HTTP_201_CREATED)
 
@@ -55,7 +61,7 @@ class EmailCheckView(APIView):
     """Public endpoint to verify whether an email exists."""
     permission_classes = [AllowAny]
 
-    def get(self, request):  # pragma: no cover - not hit by current tests
+    def get(self, request):
         email = (request.query_params.get("email") or "").strip().lower()
         if not email:
             return Response({"email": ["Missing email"]}, status=status.HTTP_400_BAD_REQUEST)

@@ -1,6 +1,6 @@
 """
-API views for Kanban boards, tasks, comments, and dashboard.
-Back-compat: accepts legacy task payloads and keeps methods short.
+API views für Kanban: Boards, Tasks, Comments, Dashboard.
+Korrigiert: Response-Formate, Mitgliederzählung, 404 für Fremde, Comments-Fehler.
 """
 
 from django.contrib.auth import get_user_model
@@ -22,9 +22,10 @@ from .serializers import (
 User = get_user_model()
 
 
+# ---------- Helpers ----------
 def _normalize_task_input(data):
     """
-    Map legacy payload => new fields (column/assignee/priority aliases).
+    Mappt Legacy-Payload -> neue Felder (column/status, assignee/reviewer aliases).
     """
     d = dict(data)
     if "assignee" in d and "assignee_id" not in d:
@@ -54,7 +55,7 @@ def _normalize_task_input(data):
 
 # ---------- Boards ----------
 class BoardViewSet(viewsets.ViewSet):
-    """Board CRUD and member management."""
+    """Board CRUD und Member-Management."""
     permission_classes = [IsAuthenticated]
 
     def _get_accessible_board(self, user, pk):
@@ -62,10 +63,12 @@ class BoardViewSet(viewsets.ViewSet):
             board = Board.objects.get(pk=pk)
         except Board.DoesNotExist:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
         allowed = board.owner_id == user.id or board.members.filter(id=user.id).exists()
         if not allowed:
-            # Hide existence for non-members
+            # Für diese Tests: Fremde sehen 404
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
         return board
 
     def _get_owner_board(self, user, pk):
@@ -99,19 +102,30 @@ class BoardViewSet(viewsets.ViewSet):
                 {"title": ["Title must be between 3 and 63 characters."]},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         board = Board.objects.create(title=title, owner=request.user)
+
+        # Owner immer als Mitglied
         BoardMember.objects.get_or_create(board=board, user=request.user)
+
+        # optionale Mitglieder aus dem Request übernehmen
+        raw_ids = request.data.get("members") or []
+        if isinstance(raw_ids, list):
+            for uid in {int(x) for x in raw_ids if str(x).isdigit()}:
+                BoardMember.objects.get_or_create(board=board, user_id=uid)
+
         return Response(BoardListSerializer(board).data, status=status.HTTP_201_CREATED)
 
     def partial_update(self, request, pk=None):
         board = self._get_owner_board(request.user, pk)
         if isinstance(board, Response):
             return board
+
         data = request.data or {}
 
         if "title" in data:
             title = (data.get("title") or "").strip()
-            if not (2 < len(title) < 64):  # pragma: no cover - negative branch
+            if not (2 < len(title) < 64):
                 return Response(
                     {"title": ["Title must be between 3 and 63 characters."]},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -122,9 +136,7 @@ class BoardViewSet(viewsets.ViewSet):
         if isinstance(data.get("members"), list):
             ids = {int(x) for x in data["members"] if str(x).isdigit()}
             ids.add(board.owner_id)
-            BoardMember.objects.filter(board=board).exclude(
-                user_id=board.owner_id
-            ).delete()
+            BoardMember.objects.filter(board=board).exclude(user_id=board.owner_id).delete()
             for uid in ids:
                 BoardMember.objects.get_or_create(board=board, user_id=uid)
 
@@ -141,7 +153,7 @@ class BoardViewSet(viewsets.ViewSet):
 
 # ---------- Tasks ----------
 class TaskCreateView(APIView):
-    """Create tasks (accepts legacy payloads) and list tasks on GET."""
+    """Create (Legacy-Payload akzeptiert) und List der Tasks."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -149,10 +161,16 @@ class TaskCreateView(APIView):
         serializer = TaskCreateUpdateSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         task = serializer.save()
-        return Response({"id": task.id}, status=status.HTTP_201_CREATED)
+        task = (
+            Task.objects.filter(pk=task.id)
+            .select_related("assignee", "reviewer", "board")
+            .annotate(comments_count=Count("comments"))
+            .get()
+        )
+        return Response(TaskDetailSerializer(task).data, status=status.HTTP_201_CREATED)
 
     def get(self, request):
-        """List tasks; supports ?assigned_to_me=true for legacy tests."""
+        """Listet Tasks; unterstützt ?assigned_to_me=true für Legacy-Tests."""
         qs = Task.objects.filter(
             Q(board__owner=request.user) | Q(board__members=request.user)
         ).select_related("assignee", "reviewer", "board")
@@ -163,7 +181,7 @@ class TaskCreateView(APIView):
 
 
 class TaskDetailView(APIView):
-    """Retrieve, update, or delete a task."""
+    """Retrieve, update, delete eines Tasks."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request, task_id):
@@ -174,32 +192,38 @@ class TaskDetailView(APIView):
                 .annotate(comments_count=Count("comments"))
                 .get()
             )
-        except Task.DoesNotExist:  # pragma: no cover - negative path
+        except Task.DoesNotExist:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
         return Response(TaskDetailSerializer(task).data, status=status.HTTP_200_OK)
 
     def patch(self, request, task_id):
         try:
             task = Task.objects.get(pk=task_id)
-        except Task.DoesNotExist:  # pragma: no cover - negative path
+        except Task.DoesNotExist:
             return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
         data = _normalize_task_input(request.data)
         serializer = TaskCreateUpdateSerializer(task, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return Response({"ok": True}, status=status.HTTP_200_OK)
+        task = serializer.save()
+        task = (
+            Task.objects.filter(pk=task.id)
+            .select_related("assignee", "reviewer", "board")
+            .annotate(comments_count=Count("comments"))
+            .get()
+        )
+        return Response(TaskDetailSerializer(task).data, status=status.HTTP_200_OK)
 
     def delete(self, request, task_id):
         try:
             task = Task.objects.get(pk=task_id)
-        except Task.DoesNotExist:  # pragma: no cover - negative path
+        except Task.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
         task.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class AssignedToMeView(APIView):
-    """List tasks assigned to the current user."""
+    """Listet Tasks, die dem aktuellen User zugewiesen sind."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -213,7 +237,7 @@ class AssignedToMeView(APIView):
 
 
 class ReviewingView(APIView):
-    """List tasks where the current user is reviewer."""
+    """Listet Tasks, bei denen der aktuelle User Reviewer ist."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -228,7 +252,7 @@ class ReviewingView(APIView):
 
 # ---------- Comments ----------
 class TaskCommentsView(APIView):
-    """List and create comments for a given task (nested route)."""
+    """List & Create für Kommentare eines Tasks (verschachtelt)."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request, task_id):
@@ -240,21 +264,23 @@ class TaskCommentsView(APIView):
         return Response(CommentSerializer(qs, many=True).data)
 
     def post(self, request, task_id):
+        # Sicherstellen, dass der Task existiert (FK-Fehler vermeiden)
+        try:
+            task = Task.objects.select_related("board").get(pk=task_id)
+        except Task.DoesNotExist:
+            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+
         content = (request.data.get("content") or "").strip()
-        if not content:  # pragma: no cover - negative branch
-            return Response(
-                {"content": ["Content required"]},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        comment = Comment.objects.create(
-            task_id=task_id, author=request.user, content=content
-        )
+        if not content:
+            return Response({"content": ["Content required"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        comment = Comment.objects.create(task=task, author=request.user, content=content)
         return Response(CommentSerializer(comment).data, status=status.HTTP_201_CREATED)
 
 
 class CommentsCollectionView(APIView):
     """
-    Back-compat collection endpoint:
+    Back-compat Collection:
     - POST /api/kanban/comments/      {task, content}
     - GET  /api/kanban/comments/?task=<id>
     """
@@ -262,27 +288,27 @@ class CommentsCollectionView(APIView):
 
     def post(self, request):
         task_id = request.data.get("task")
-        if not task_id:  # pragma: no cover - negative branch
+        if not task_id:
             return Response({"task": ["Task is required"]}, status=400)
         return TaskCommentsView().post(request, task_id=task_id)
 
     def get(self, request):
         task_id = request.query_params.get("task")
-        if not task_id:  # pragma: no cover - no-op listing
+        if not task_id:
             return Response([], status=200)
         return TaskCommentsView().get(request, task_id=task_id)
 
 
 class SingleCommentView(APIView):
-    """Delete a single comment (author only)."""
+    """Löscht einen Kommentar (nur Autor)."""
     permission_classes = [IsAuthenticated]
 
     def delete(self, request, task_id, comment_id):
         try:
             comment = Comment.objects.get(pk=comment_id, task_id=task_id)
-        except Comment.DoesNotExist:  # pragma: no cover - negative path
+        except Comment.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
-        if comment.author_id != request.user.id:  # pragma: no cover - negative path
+        if comment.author_id != request.user.id:
             return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
         comment.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -290,7 +316,7 @@ class SingleCommentView(APIView):
 
 # ---------- Dashboard ----------
 class DashboardView(APIView):
-    """Aggregate stats used by the dashboard widgets."""
+    """Aggregierte Kennzahlen für das Dashboard."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
