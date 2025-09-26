@@ -1,334 +1,327 @@
 """
-API views für Kanban: Boards, Tasks, Comments, Dashboard.
-Korrigiert: Response-Formate, Mitgliederzählung, 404 für Fremde, Comments-Fehler.
+Views für Kanban-API gemäß Dokumentation.
+Achtet auf exakte Antwortformate und korrekte Berechtigungen.
 """
-
-from django.contrib.auth import get_user_model
-from django.db.models import Count, Q
-from rest_framework import status, viewsets
-from rest_framework.permissions import IsAuthenticated
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+from rest_framework import status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.contrib.auth import get_user_model
 
-from kanban_app.models import Board, BoardMember, Comment, Task
+from kanban_app.models import Board, Task, Comment
 from .serializers import (
+    UserMiniSerializer,
+    BoardListItemSerializer,
+    BoardCreateSerializer,
+    BoardCreateResponseSerializer,
     BoardDetailSerializer,
-    BoardListSerializer,
-    CommentSerializer,
-    TaskCreateUpdateSerializer,
+    BoardMemberSerializer,
+    TaskOnBoardSerializer,
+    BoardUpdateSerializer,
+    BoardUpdateResponseSerializer,
+    TaskCreateSerializer,
     TaskDetailSerializer,
+    TaskUpdateSerializer,
+    CommentSerializer,
+    CommentCreateSerializer,
 )
 
 User = get_user_model()
 
+# ---------- Hilfsfunktionen ----------
 
-# ---------- Helpers ----------
-def _normalize_task_input(data):
-    """
-    Mappt Legacy-Payload -> neue Felder (column/status, assignee/reviewer aliases).
-    """
-    d = dict(data)
-    if "assignee" in d and "assignee_id" not in d:
-        d["assignee_id"] = d.pop("assignee")
-    if "reviewer" in d and "reviewer_id" not in d:
-        d["reviewer_id"] = d.pop("reviewer")
-    if "status" not in d and "column" in d:
-        col = d["column"]
-        name_map = {
-            "todo": "to-do",
-            "to-do": "to-do",
-            "doing": "in-progress",
-            "in-progress": "in-progress",
-            "review": "review",
-            "done": "done",
-        }
-        if isinstance(col, str):
-            d["status"] = name_map.get(col.strip().lower(), "to-do")
-        else:
-            d["status"] = {0: "to-do", 1: "in-progress", 2: "review", 3: "done"}.get(
-                int(col), "to-do"
-            )
-    if str(d.get("priority", "")).lower() in {"mid", "med"}:
-        d["priority"] = "medium"
-    return d
+def is_board_member_or_owner(board: Board, user) -> bool:
+    return board.owner_id == user.id or board.members.filter(id=user.id).exists()
+
+def forbid_403():
+    return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
+def ensure_board_member(board: Board, user):
+    if not is_board_member_or_owner(board, user):
+        return forbid_403()
+    return None
+
+def ensure_board_owner(board: Board, user):
+    if board.owner_id != user.id:
+        return forbid_403()
+    return None
+
+def serialize_task_for_board(task: Task):
+    task.comments_count = task.comments.count()
+    return TaskOnBoardSerializer(task).data
+
+def serialize_task_detail(task: Task):
+    task.comments_count = task.comments.count()
+    return TaskDetailSerializer(task).data
 
 
 # ---------- Boards ----------
-class BoardViewSet(viewsets.ViewSet):
-    """Board CRUD und Member-Management."""
-    permission_classes = [IsAuthenticated]
 
-    def _get_accessible_board(self, user, pk):
-        try:
-            board = Board.objects.get(pk=pk)
-        except Board.DoesNotExist:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+class BoardsCollectionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
-        allowed = board.owner_id == user.id or board.members.filter(id=user.id).exists()
-        if not allowed:
-            # Für diese Tests: Fremde sehen 404
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+    def get(self, request):
+        user = request.user
+        boards = Board.objects.filter(Q(owner_id=user.id) | Q(members__id=user.id)).distinct()
 
-        return board
+        items = []
+        for b in boards:
+            tasks_qs = Task.objects.filter(board=b)
+            items.append({
+                "id": b.id,
+                "title": b.title,
+                "member_count": b.members.count(),
+                "ticket_count": tasks_qs.count(),
+                "tasks_to_do_count": tasks_qs.filter(status="to-do").count(),
+                "tasks_high_prio_count": tasks_qs.filter(priority="high").count(),
+                "owner_id": b.owner_id,
+            })
 
-    def _get_owner_board(self, user, pk):
-        try:
-            board = Board.objects.get(pk=pk)
-        except Board.DoesNotExist:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        if board.owner_id != user.id:
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
-        return board
+        return Response(BoardListItemSerializer(items, many=True).data, status=status.HTTP_200_OK)
 
-    def list(self, request):
-        boards = (
-            Board.objects.filter(Q(owner=request.user) | Q(members=request.user))
-            .distinct()
-            .order_by("id")
-        )
-        return Response(BoardListSerializer(boards, many=True).data)
+    def post(self, request):
+        user = request.user
+        ser = BoardCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
 
-    def retrieve(self, request, pk=None):
-        board = self._get_accessible_board(request.user, pk)
-        if isinstance(board, Response):
-            return board
-        board = Board.objects.filter(pk=pk).prefetch_related("members").get()
-        return Response(BoardDetailSerializer(board).data)
+        board = Board.objects.create(title=ser.validated_data["title"].strip(), owner=user)
 
-    def create(self, request):
-        title = (request.data.get("title") or "").strip()
-        if not (2 < len(title) < 64):
-            return Response(
-                {"title": ["Title must be between 3 and 63 characters."]},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        member_ids = ser.validated_data["members"]
+        if member_ids:
+            users = User.objects.filter(id__in=member_ids)
+            board.members.add(*users)
 
-        board = Board.objects.create(title=title, owner=request.user)
+        tasks_qs = Task.objects.filter(board=board)
+        resp = {
+            "id": board.id,
+            "title": board.title,
+            "member_count": board.members.count(),
+            "ticket_count": tasks_qs.count(),
+            "tasks_to_do_count": tasks_qs.filter(status="to-do").count(),
+            "tasks_high_prio_count": tasks_qs.filter(priority="high").count(),
+            "owner_id": board.owner_id,
+        }
+        return Response(BoardCreateResponseSerializer(resp).data, status=status.HTTP_201_CREATED)
 
-        # Owner immer als Mitglied
-        BoardMember.objects.get_or_create(board=board, user=request.user)
 
-        # optionale Mitglieder aus dem Request übernehmen
-        raw_ids = request.data.get("members") or []
-        if isinstance(raw_ids, list):
-            for uid in {int(x) for x in raw_ids if str(x).isdigit()}:
-                BoardMember.objects.get_or_create(board=board, user_id=uid)
+class BoardDetailView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
-        return Response(BoardListSerializer(board).data, status=status.HTTP_201_CREATED)
+    def get(self, request, board_id: int):
+        board = get_object_or_404(Board, id=board_id)
+        forbid = ensure_board_member(board, request.user)
+        if forbid:
+            return forbid
 
-    def partial_update(self, request, pk=None):
-        board = self._get_owner_board(request.user, pk)
-        if isinstance(board, Response):
-            return board
+        members = board.members.all().order_by("id")
+        tasks = Task.objects.filter(board=board).select_related("assignee", "reviewer")
 
-        data = request.data or {}
+        payload = {
+            "id": board.id,
+            "title": board.title,
+            "owner_id": board.owner_id,
+            "members": BoardMemberSerializer(members, many=True).data,
+            "tasks": [serialize_task_for_board(t) for t in tasks],
+        }
+        return Response(BoardDetailSerializer(payload).data, status=status.HTTP_200_OK)
 
-        if "title" in data:
-            title = (data.get("title") or "").strip()
-            if not (2 < len(title) < 64):
-                return Response(
-                    {"title": ["Title must be between 3 and 63 characters."]},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            board.title = title
+    def patch(self, request, board_id: int):
+        board = get_object_or_404(Board, id=board_id)
+        forbid = ensure_board_member(board, request.user)  # laut Doku: Owner ODER Member
+        if forbid:
+            return forbid
+
+        ser = BoardUpdateSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
+
+        if "title" in ser.validated_data:
+            board.title = ser.validated_data["title"].strip()
             board.save(update_fields=["title"])
 
-        if isinstance(data.get("members"), list):
-            ids = {int(x) for x in data["members"] if str(x).isdigit()}
-            ids.add(board.owner_id)
-            BoardMember.objects.filter(board=board).exclude(user_id=board.owner_id).delete()
-            for uid in ids:
-                BoardMember.objects.get_or_create(board=board, user_id=uid)
+        if "members" in ser.validated_data:
+            users = User.objects.filter(id__in=ser.validated_data["members"])
+            board.members.set(users)
 
-        board = Board.objects.prefetch_related("members").get(pk=board.pk)
-        return Response(BoardDetailSerializer(board).data)
+        payload = {
+            "id": board.id,
+            "title": board.title,
+            "owner_data": UserMiniSerializer(board.owner).data,
+            "members_data": UserMiniSerializer(board.members.all(), many=True).data,
+        }
+        return Response(BoardUpdateResponseSerializer(payload).data, status=status.HTTP_200_OK)
 
-    def destroy(self, request, pk=None):
-        board = self._get_owner_board(request.user, pk)
-        if isinstance(board, Response):
-            return board
+    def delete(self, request, board_id: int):
+        board = get_object_or_404(Board, id=board_id)
+        forbid = ensure_board_owner(board, request.user)  # nur Owner
+        if forbid:
+            return forbid
         board.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # ---------- Tasks ----------
-class TaskCreateView(APIView):
-    """Create (Legacy-Payload akzeptiert) und List der Tasks."""
-    permission_classes = [IsAuthenticated]
 
-    def post(self, request):
-        data = _normalize_task_input(request.data)
-        serializer = TaskCreateUpdateSerializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        task = serializer.save()
-        task = (
-            Task.objects.filter(pk=task.id)
-            .select_related("assignee", "reviewer", "board")
-            .annotate(comments_count=Count("comments"))
-            .get()
-        )
-        return Response(TaskDetailSerializer(task).data, status=status.HTTP_201_CREATED)
+class TasksCollectionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        """Listet Tasks; unterstützt ?assigned_to_me=true für Legacy-Tests."""
-        qs = Task.objects.filter(
-            Q(board__owner=request.user) | Q(board__members=request.user)
-        ).select_related("assignee", "reviewer", "board")
-        if (request.query_params.get("assigned_to_me") or "").lower() == "true":
-            qs = qs.filter(assignee=request.user)
-        qs = qs.annotate(comments_count=Count("comments")).order_by("id")
-        return Response(TaskDetailSerializer(qs, many=True).data)
+        # Hilfs-Liste (nicht in der Doku, aber praktisch): alle Tasks auf zugänglichen Boards
+        user = request.user
+        board_ids = Board.objects.filter(Q(owner_id=user.id) | Q(members__id=user.id)).values_list("id", flat=True)
+        tasks = Task.objects.filter(board_id__in=board_ids).select_related("assignee", "reviewer")
+        return Response([serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK)
+
+    def post(self, request):
+        user = request.user
+        ser = TaskCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        board = get_object_or_404(Board, id=ser.validated_data["board"])
+        forbid = ensure_board_member(board, user)
+        if forbid:
+            return forbid
+
+        def resolve_user(optional_id):
+            if optional_id in (None, "",):
+                return None
+            u = get_object_or_404(User, id=optional_id)
+            if not is_board_member_or_owner(board, u):
+                # muss Mitglied/Owner sein
+                raise ValueError("assignee/reviewer muss Board-Mitglied sein.")
+            return u
+
+        try:
+            assignee = resolve_user(ser.validated_data.get("assignee_id"))
+            reviewer = resolve_user(ser.validated_data.get("reviewer_id"))
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # --- WICHTIG: created_by nur setzen, wenn Feld existiert (verhindert 500) ---
+        kwargs = dict(
+            board=board,
+            title=ser.validated_data["title"].strip(),
+            description=ser.validated_data.get("description", "").strip(),
+            status=ser.validated_data["status"],
+            priority=ser.validated_data["priority"],
+            assignee=assignee,
+            reviewer=reviewer,
+            due_date=ser.validated_data.get("due_date"),
+        )
+        if hasattr(Task, "created_by"):
+            kwargs["created_by"] = user
+
+        task = Task.objects.create(**kwargs)
+        return Response(serialize_task_detail(task), status=status.HTTP_201_CREATED)
 
 
 class TaskDetailView(APIView):
-    """Retrieve, update, delete eines Tasks."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
-    def get(self, request, task_id):
-        try:
-            task = (
-                Task.objects.filter(pk=task_id)
-                .select_related("assignee", "reviewer", "board")
-                .annotate(comments_count=Count("comments"))
-                .get()
-            )
-        except Task.DoesNotExist:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        return Response(TaskDetailSerializer(task).data, status=status.HTTP_200_OK)
+    def patch(self, request, task_id: int):
+        task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
+        forbid = ensure_board_member(task.board, request.user)
+        if forbid:
+            return forbid
 
-    def patch(self, request, task_id):
-        try:
-            task = Task.objects.get(pk=task_id)
-        except Task.DoesNotExist:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        data = _normalize_task_input(request.data)
-        serializer = TaskCreateUpdateSerializer(task, data=data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        task = serializer.save()
-        task = (
-            Task.objects.filter(pk=task.id)
-            .select_related("assignee", "reviewer", "board")
-            .annotate(comments_count=Count("comments"))
-            .get()
-        )
-        return Response(TaskDetailSerializer(task).data, status=status.HTTP_200_OK)
+        ser = TaskUpdateSerializer(data=request.data, partial=True)
+        ser.is_valid(raise_exception=True)
 
-    def delete(self, request, task_id):
+        if "title" in ser.validated_data:
+            task.title = ser.validated_data["title"].strip()
+        if "description" in ser.validated_data:
+            task.description = ser.validated_data["description"]
+        if "status" in ser.validated_data:
+            task.status = ser.validated_data["status"]
+        if "priority" in ser.validated_data:
+            task.priority = ser.validated_data["priority"]
+        if "due_date" in ser.validated_data:
+            task.due_date = ser.validated_data["due_date"]
+
+        def resolve_user(optional_id):
+            if optional_id in (None, "",):
+                return None
+            u = get_object_or_404(User, id=optional_id)
+            if not is_board_member_or_owner(task.board, u):
+                raise ValueError("assignee/reviewer muss Board-Mitglied sein.")
+            return u
+
         try:
-            task = Task.objects.get(pk=task_id)
-        except Task.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+            if "assignee_id" in ser.validated_data:
+                task.assignee = resolve_user(ser.validated_data["assignee_id"])
+            if "reviewer_id" in ser.validated_data:
+                task.reviewer = resolve_user(ser.validated_data["reviewer_id"])
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        task.save()
+        return Response(serialize_task_detail(task), status=status.HTTP_200_OK)
+
+    def delete(self, request, task_id: int):
+        task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
+        board = task.board
+        allowed = (board.owner_id == request.user.id)
+        if hasattr(task, "created_by") and task.created_by_id == request.user.id:
+            allowed = True
+        if not allowed:
+            return forbid_403()
         task.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class AssignedToMeView(APIView):
-    """Listet Tasks, die dem aktuellen User zugewiesen sind."""
-    permission_classes = [IsAuthenticated]
+# ---------- Filter-Views (aus Doku) ----------
+
+class TasksAssignedToMeView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        qs = (
-            Task.objects.filter(assignee=request.user)
-            .select_related("assignee", "reviewer", "board")
-            .annotate(comments_count=Count("comments"))
-            .order_by("id")
-        )
-        return Response(TaskDetailSerializer(qs, many=True).data)
+        tasks = Task.objects.filter(assignee=request.user).select_related("assignee", "reviewer")
+        return Response([serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK)
 
 
-class ReviewingView(APIView):
-    """Listet Tasks, bei denen der aktuelle User Reviewer ist."""
-    permission_classes = [IsAuthenticated]
+class TasksReviewingView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        qs = (
-            Task.objects.filter(reviewer=request.user)
-            .select_related("assignee", "reviewer", "board")
-            .annotate(comments_count=Count("comments"))
-            .order_by("id")
-        )
-        return Response(TaskDetailSerializer(qs, many=True).data)
+        tasks = Task.objects.filter(reviewer=request.user).select_related("assignee", "reviewer")
+        return Response([serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK)
 
 
 # ---------- Comments ----------
-class TaskCommentsView(APIView):
-    """List & Create für Kommentare eines Tasks (verschachtelt)."""
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request, task_id):
-        qs = (
-            Comment.objects.filter(task_id=task_id)
-            .select_related("author")
-            .order_by("-id")
-        )
-        return Response(CommentSerializer(qs, many=True).data)
-
-    def post(self, request, task_id):
-        # Sicherstellen, dass der Task existiert (FK-Fehler vermeiden)
-        try:
-            task = Task.objects.select_related("board").get(pk=task_id)
-        except Task.DoesNotExist:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        content = (request.data.get("content") or "").strip()
-        if not content:
-            return Response({"content": ["Content required"]}, status=status.HTTP_400_BAD_REQUEST)
-
-        comment = Comment.objects.create(task=task, author=request.user, content=content)
-        return Response(CommentSerializer(comment).data, status=status.HTTP_201_CREATED)
-
 
 class CommentsCollectionView(APIView):
-    """
-    Back-compat Collection:
-    - POST /api/kanban/comments/      {task, content}
-    - GET  /api/kanban/comments/?task=<id>
-    """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
-    def post(self, request):
-        task_id = request.data.get("task")
-        if not task_id:
-            return Response({"task": ["Task is required"]}, status=400)
-        return TaskCommentsView().post(request, task_id=task_id)
+    def get(self, request, task_id: int):
+        task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
+        forbid = ensure_board_member(task.board, request.user)
+        if forbid:
+            return forbid
+        comments = task.comments.all().order_by("id")
+        return Response(CommentSerializer(comments, many=True).data, status=status.HTTP_200_OK)
 
-    def get(self, request):
-        task_id = request.query_params.get("task")
-        if not task_id:
-            return Response([], status=200)
-        return TaskCommentsView().get(request, task_id=task_id)
+    def post(self, request, task_id: int):
+        task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
+        forbid = ensure_board_member(task.board, request.user)
+        if forbid:
+            return forbid
+
+        ser = CommentCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        c = Comment.objects.create(task=task, author=request.user, content=ser.validated_data["content"])
+        return Response(CommentSerializer(c).data, status=status.HTTP_201_CREATED)
 
 
-class SingleCommentView(APIView):
-    """Löscht einen Kommentar (nur Autor)."""
-    permission_classes = [IsAuthenticated]
+class CommentDeleteView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
 
-    def delete(self, request, task_id, comment_id):
-        try:
-            comment = Comment.objects.get(pk=comment_id, task_id=task_id)
-        except Comment.DoesNotExist:
-            return Response(status=status.HTTP_404_NOT_FOUND)
+    def delete(self, request, task_id: int, comment_id: int):
+        task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
+        forbid = ensure_board_member(task.board, request.user)
+        if forbid:
+            return forbid
+        comment = get_object_or_404(Comment, id=comment_id, task=task)
         if comment.author_id != request.user.id:
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+            return forbid_403()
         comment.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-# ---------- Dashboard ----------
-class DashboardView(APIView):
-    """Aggregierte Kennzahlen für das Dashboard."""
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        qs = Task.objects.filter(
-            Q(board__owner=request.user) | Q(board__members=request.user)
-        ).distinct()
-        pri = qs.values("priority").annotate(count=Count("id"))
-        sta = qs.values("status").annotate(count=Count("id"))
-        return Response(
-            {
-                "tickets_total": qs.count(),
-                "by_priority": {r["priority"]: r["count"] for r in pri},
-                "by_status": {r["status"]: r["count"] for r in sta},
-            }
-        )
