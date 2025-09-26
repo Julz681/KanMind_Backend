@@ -1,6 +1,6 @@
 """
-Views für Kanban-API gemäß Dokumentation.
-Achtet auf exakte Antwortformate und korrekte Berechtigungen.
+Views for the Kanban API as defined in the specification.
+Ensures exact response shapes and correct permission checks.
 """
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -29,63 +29,114 @@ from .serializers import (
 
 User = get_user_model()
 
-# ---------- Hilfsfunktionen ----------
+# ---------- Helper functions ----------
+
 
 def is_board_member_or_owner(board: Board, user) -> bool:
+    """
+    Return True if the given user is the board owner or a member of the board.
+    """
     return board.owner_id == user.id or board.members.filter(id=user.id).exists()
 
+
 def forbid_403():
+    """
+    Convenience helper to return a standard 403 Forbidden response body.
+    """
     return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
+
 def ensure_board_member(board: Board, user):
+    """
+    Ensure the user is allowed to access the board (owner OR member).
+    Returns a 403 Response if access is forbidden; otherwise returns None.
+    """
     if not is_board_member_or_owner(board, user):
         return forbid_403()
     return None
 
+
 def ensure_board_owner(board: Board, user):
+    """
+    Ensure the user is the owner of the board.
+    Returns a 403 Response if not the owner; otherwise returns None.
+    """
     if board.owner_id != user.id:
         return forbid_403()
     return None
 
+
 def serialize_task_for_board(task: Task):
+    """
+    Attach a computed comments_count to the task and serialize it for
+    inclusion inside board payloads.
+    """
     task.comments_count = task.comments.count()
     return TaskOnBoardSerializer(task).data
 
+
 def serialize_task_detail(task: Task):
+    """
+    Attach a computed comments_count to the task and serialize it for
+    standalone task detail payloads.
+    """
     task.comments_count = task.comments.count()
     return TaskDetailSerializer(task).data
 
 
 # ---------- Boards ----------
 
+
 class BoardsCollectionView(APIView):
+    """
+    GET: List all boards the current user can access (owner or member).
+    POST: Create a new board and optionally add initial members.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        """
+        Return a list of boards accessible to the current user with
+        aggregated task counters.
+        """
         user = request.user
-        boards = Board.objects.filter(Q(owner_id=user.id) | Q(members__id=user.id)).distinct()
+        boards = (
+            Board.objects.filter(Q(owner_id=user.id) | Q(members__id=user.id))
+            .distinct()
+        )
 
         items = []
         for b in boards:
             tasks_qs = Task.objects.filter(board=b)
-            items.append({
-                "id": b.id,
-                "title": b.title,
-                "member_count": b.members.count(),
-                "ticket_count": tasks_qs.count(),
-                "tasks_to_do_count": tasks_qs.filter(status="to-do").count(),
-                "tasks_high_prio_count": tasks_qs.filter(priority="high").count(),
-                "owner_id": b.owner_id,
-            })
+            items.append(
+                {
+                    "id": b.id,
+                    "title": b.title,
+                    "member_count": b.members.count(),
+                    "ticket_count": tasks_qs.count(),
+                    "tasks_to_do_count": tasks_qs.filter(status="to-do").count(),
+                    "tasks_high_prio_count": tasks_qs.filter(priority="high").count(),
+                    "owner_id": b.owner_id,
+                }
+            )
 
-        return Response(BoardListItemSerializer(items, many=True).data, status=status.HTTP_200_OK)
+        return Response(
+            BoardListItemSerializer(items, many=True).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request):
+        """
+        Create a new board owned by the current user. Optionally adds
+        provided member IDs after validation. Returns the board summary.
+        """
         user = request.user
         ser = BoardCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
-        board = Board.objects.create(title=ser.validated_data["title"].strip(), owner=user)
+        board = Board.objects.create(
+            title=ser.validated_data["title"].strip(), owner=user
+        )
 
         member_ids = ser.validated_data["members"]
         if member_ids:
@@ -102,20 +153,34 @@ class BoardsCollectionView(APIView):
             "tasks_high_prio_count": tasks_qs.filter(priority="high").count(),
             "owner_id": board.owner_id,
         }
-        return Response(BoardCreateResponseSerializer(resp).data, status=status.HTTP_201_CREATED)
+        return Response(
+            BoardCreateResponseSerializer(resp).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class BoardDetailView(APIView):
+    """
+    GET: Retrieve a single board (owner OR member required), including
+         members and tasks.
+    PATCH: Update board title and/or members (owner OR member required).
+    DELETE: Delete the board (owner only).
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, board_id: int):
+        """
+        Return board details including members and all tasks on the board.
+        """
         board = get_object_or_404(Board, id=board_id)
         forbid = ensure_board_member(board, request.user)
         if forbid:
             return forbid
 
         members = board.members.all().order_by("id")
-        tasks = Task.objects.filter(board=board).select_related("assignee", "reviewer")
+        tasks = Task.objects.filter(board=board).select_related(
+            "assignee", "reviewer"
+        )
 
         payload = {
             "id": board.id,
@@ -124,11 +189,17 @@ class BoardDetailView(APIView):
             "members": BoardMemberSerializer(members, many=True).data,
             "tasks": [serialize_task_for_board(t) for t in tasks],
         }
-        return Response(BoardDetailSerializer(payload).data, status=status.HTTP_200_OK)
+        return Response(
+            BoardDetailSerializer(payload).data, status=status.HTTP_200_OK
+        )
 
     def patch(self, request, board_id: int):
+        """
+        Partially update board fields (title, members).
+        Per spec: allowed for owner OR any member.
+        """
         board = get_object_or_404(Board, id=board_id)
-        forbid = ensure_board_member(board, request.user)  # laut Doku: Owner ODER Member
+        forbid = ensure_board_member(board, request.user)  # per spec: owner OR member
         if forbid:
             return forbid
 
@@ -149,11 +220,16 @@ class BoardDetailView(APIView):
             "owner_data": UserMiniSerializer(board.owner).data,
             "members_data": UserMiniSerializer(board.members.all(), many=True).data,
         }
-        return Response(BoardUpdateResponseSerializer(payload).data, status=status.HTTP_200_OK)
+        return Response(
+            BoardUpdateResponseSerializer(payload).data, status=status.HTTP_200_OK
+        )
 
     def delete(self, request, board_id: int):
+        """
+        Delete the board. Only the board owner is allowed to perform this.
+        """
         board = get_object_or_404(Board, id=board_id)
-        forbid = ensure_board_owner(board, request.user)  # nur Owner
+        forbid = ensure_board_owner(board, request.user)  # owner only
         if forbid:
             return forbid
         board.delete()
@@ -162,17 +238,36 @@ class BoardDetailView(APIView):
 
 # ---------- Tasks ----------
 
+
 class TasksCollectionView(APIView):
+    """
+    GET: Convenience endpoint (not in spec) returning all tasks across
+         boards accessible to the current user.
+    POST: Create a task on a specific board (owner OR member required).
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        # Hilfs-Liste (nicht in der Doku, aber praktisch): alle Tasks auf zugänglichen Boards
+        """
+        Return all tasks that belong to boards the user can access.
+        """
+        # Helper list (not in the spec but practical): all tasks on accessible boards
         user = request.user
-        board_ids = Board.objects.filter(Q(owner_id=user.id) | Q(members__id=user.id)).values_list("id", flat=True)
-        tasks = Task.objects.filter(board_id__in=board_ids).select_related("assignee", "reviewer")
-        return Response([serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK)
+        board_ids = Board.objects.filter(
+            Q(owner_id=user.id) | Q(members__id=user.id)
+        ).values_list("id", flat=True)
+        tasks = Task.objects.filter(board_id__in=board_ids).select_related(
+            "assignee", "reviewer"
+        )
+        return Response(
+            [serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK
+        )
 
     def post(self, request):
+        """
+        Create a new task on the specified board. Assignee/Reviewer must
+        be members (or owner) of that board if provided.
+        """
         user = request.user
         ser = TaskCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -183,12 +278,16 @@ class TasksCollectionView(APIView):
             return forbid
 
         def resolve_user(optional_id):
-            if optional_id in (None, "",):
+            """
+            Resolve an optional user ID to a User instance and ensure
+            they belong to the board. Returns None if ID is empty/None.
+            """
+            if optional_id in (None, ""):
                 return None
             u = get_object_or_404(User, id=optional_id)
             if not is_board_member_or_owner(board, u):
-                # muss Mitglied/Owner sein
-                raise ValueError("assignee/reviewer muss Board-Mitglied sein.")
+                # must be a board member/owner
+                raise ValueError("Assignee/Reviewer must be a board member.")
             return u
 
         try:
@@ -197,7 +296,7 @@ class TasksCollectionView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # --- WICHTIG: created_by nur setzen, wenn Feld existiert (verhindert 500) ---
+        # IMPORTANT: only set created_by if the field exists (avoid 500s)
         kwargs = dict(
             board=board,
             title=ser.validated_data["title"].strip(),
@@ -216,9 +315,17 @@ class TasksCollectionView(APIView):
 
 
 class TaskDetailView(APIView):
+    """
+    PATCH: Update fields of a task (owner OR member of the task's board).
+    DELETE: Delete a task (board owner or task creator if field exists).
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def patch(self, request, task_id: int):
+        """
+        Partially update task fields. Assignee/Reviewer, if provided,
+        must belong to the same board.
+        """
         task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
         forbid = ensure_board_member(task.board, request.user)
         if forbid:
@@ -239,11 +346,15 @@ class TaskDetailView(APIView):
             task.due_date = ser.validated_data["due_date"]
 
         def resolve_user(optional_id):
-            if optional_id in (None, "",):
+            """
+            Resolve an optional user ID to a User instance and ensure
+            they belong to the task's board. Returns None for empty IDs.
+            """
+            if optional_id in (None, ""):
                 return None
             u = get_object_or_404(User, id=optional_id)
             if not is_board_member_or_owner(task.board, u):
-                raise ValueError("assignee/reviewer muss Board-Mitglied sein.")
+                raise ValueError("Assignee/Reviewer must be a board member.")
             return u
 
         try:
@@ -258,9 +369,13 @@ class TaskDetailView(APIView):
         return Response(serialize_task_detail(task), status=status.HTTP_200_OK)
 
     def delete(self, request, task_id: int):
+        """
+        Delete a task. Allowed if the requester is the board owner or,
+        when the model has a created_by field, the task creator.
+        """
         task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
         board = task.board
-        allowed = (board.owner_id == request.user.id)
+        allowed = board.owner_id == request.user.id
         if hasattr(task, "created_by") and task.created_by_id == request.user.id:
             allowed = True
         if not allowed:
@@ -269,38 +384,74 @@ class TaskDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ---------- Filter-Views (aus Doku) ----------
+# ---------- Filter views (from spec) ----------
+
 
 class TasksAssignedToMeView(APIView):
+    """
+    GET: Return tasks where the current user is the assignee.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        tasks = Task.objects.filter(assignee=request.user).select_related("assignee", "reviewer")
-        return Response([serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK)
+        """
+        List tasks assigned to the current user.
+        """
+        tasks = Task.objects.filter(assignee=request.user).select_related(
+            "assignee", "reviewer"
+        )
+        return Response(
+            [serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK
+        )
 
 
 class TasksReviewingView(APIView):
+    """
+    GET: Return tasks where the current user is the reviewer.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        tasks = Task.objects.filter(reviewer=request.user).select_related("assignee", "reviewer")
-        return Response([serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK)
+        """
+        List tasks where the current user acts as the reviewer.
+        """
+        tasks = Task.objects.filter(reviewer=request.user).select_related(
+            "assignee", "reviewer"
+        )
+        return Response(
+            [serialize_task_detail(t) for t in tasks], status=status.HTTP_200_OK
+        )
 
 
 # ---------- Comments ----------
 
+
 class CommentsCollectionView(APIView):
+    """
+    GET: List all comments for a task (board owner/member required).
+    POST: Create a new comment on a task.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, task_id: int):
+        """
+        Return all comments for the given task if the user has access
+        to the task's board.
+        """
         task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
         forbid = ensure_board_member(task.board, request.user)
         if forbid:
             return forbid
         comments = task.comments.all().order_by("id")
-        return Response(CommentSerializer(comments, many=True).data, status=status.HTTP_200_OK)
+        return Response(
+            CommentSerializer(comments, many=True).data,
+            status=status.HTTP_200_OK,
+        )
 
     def post(self, request, task_id: int):
+        """
+        Create a new comment authored by the current user on the given task.
+        """
         task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
         forbid = ensure_board_member(task.board, request.user)
         if forbid:
@@ -308,14 +459,26 @@ class CommentsCollectionView(APIView):
 
         ser = CommentCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
-        c = Comment.objects.create(task=task, author=request.user, content=ser.validated_data["content"])
+        c = Comment.objects.create(
+            task=task,
+            author=request.user,
+            content=ser.validated_data["content"],
+        )
         return Response(CommentSerializer(c).data, status=status.HTTP_201_CREATED)
 
 
 class CommentDeleteView(APIView):
+    """
+    DELETE: Remove a specific comment from a task.
+    Only the comment author may delete their comment.
+    """
     permission_classes = [permissions.IsAuthenticated]
 
     def delete(self, request, task_id: int, comment_id: int):
+        """
+        Delete a comment by ID if the requester is the author and has
+        access to the task's board.
+        """
         task = get_object_or_404(Task.objects.select_related("board"), id=task_id)
         forbid = ensure_board_member(task.board, request.user)
         if forbid:
